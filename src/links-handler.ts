@@ -339,6 +339,33 @@ export class LinksHandler {
 	}
 
 
+	async getNotesThatHaveLinkToFileInCanvas(filePath: string): Promise<string[]> {
+		let notes: string[] = [];
+		let allFiles = this.app.vault.getFiles();
+		
+		for (let file of allFiles) {
+			if (file.extension === 'canvas') {
+				let content = await this.app.vault.read(file);
+				let canvasData = JSON.parse(content);
+				
+				// Search in nodes for file references
+				for (let node of canvasData.nodes) {
+					if (node.type === 'file' && node.file) {
+						let linkPath = this.getFullPathForLink(node.file, file.path);
+						if (linkPath === filePath) {
+							if (!notes.contains(file.path)) {
+								notes.push(file.path);
+							}
+						}
+					}
+				}
+			}
+		}
+		
+		return notes;
+	}
+
+
 	getFilePathWithRenamedBaseName(filePath: string, newBaseName: string): string {
 		return Utils.normalizePathForFile(path.join(path.dirname(filePath), newBaseName + path.extname(filePath)));
 	}
@@ -540,6 +567,64 @@ export class LinksHandler {
 
 		if (dirty)
 			await this.app.vault.modify(noteFile, text);
+	}
+
+
+	async updateChangedPathInCanvas(canvasPath: string, oldLink: string, newLink: string) {
+		let file = this.getFileByPath(canvasPath);
+		if (!file) {
+			console.error(this.consoleLogPrefix + "cant update links in canvas, file not found: " + canvasPath);
+			return;
+		}
+
+		let content = await this.app.vault.read(file);
+		let canvasData = JSON.parse(content);
+		let dirty = false;
+
+		for (let node of canvasData.nodes) {
+			if (node.type === 'file' && node.file) {
+				let fullLink = this.getFullPathForLink(node.file, canvasPath);
+				if (fullLink === oldLink) {
+					let newRelLink = path.relative(path.dirname(canvasPath), newLink);
+					if (newRelLink.startsWith("../")) {
+						newRelLink = newRelLink.substring(3);
+					}
+					node.file = newRelLink;
+					dirty = true;
+				}
+			}
+		}
+
+		if (dirty) {
+			// Preserve original formatting by using the exact same content up to the modified part
+			let originalLines = content.split('\n');
+			let modifiedContent = '';
+			let inNodesSection = false;
+			let nodeIndex = -1;
+
+			for (let line of originalLines) {
+				if (line.includes('"nodes":')) {
+					inNodesSection = true;
+					modifiedContent += line + '\n';
+					continue;
+				}
+
+				if (inNodesSection) {
+					if (line.includes('"file":')) {
+						let node = canvasData.nodes[++nodeIndex];
+						if (node && node.file) {
+							// Preserve indentation
+							let indent = line.match(/^\s*/)[0];
+							modifiedContent += `${indent}"file": "${node.file}",\n`;
+							continue;
+						}
+					}
+				}
+				modifiedContent += line + '\n';
+			}
+
+			await this.app.vault.modify(file, modifiedContent.trimEnd());
+		}
 	}
 
 

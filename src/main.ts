@@ -4,13 +4,9 @@ import { LinksHandler, LinkChangeInfo } from './links-handler';
 import { path } from './path';
 import { Md5 } from './md5/md5';
 
-
-
-
 export default class ConsistentAttachmentsAndLinks extends Plugin {
 	settings: PluginSettings;
 	lh: LinksHandler;
-
 
 	async onload() {
 		await this.loadSettings();
@@ -29,10 +25,8 @@ export default class ConsistentAttachmentsAndLinks extends Plugin {
 			callback: () => this.renameOnlyActiveAttachments()
 		});
 
-
 		this.lh = new LinksHandler(this.app, "Unique attachments: ");
 	}
-
 
 	async renameAllAttachments() {
 		let files = this.app.vault.getFiles();
@@ -52,16 +46,21 @@ export default class ConsistentAttachmentsAndLinks extends Plugin {
 			new Notice("Renamed " + renamedCount + " files.");
 	}
 
-
 	async renameOnlyActiveAttachments() {
-		let mdfile = this.app.workspace.getActiveFile();
-
-		// check if the active file is the Markdown file
-		if (!mdfile.path.endsWith(".md")) {
+		let activeFile = this.app.workspace.getActiveFile();
+		
+		if (!activeFile) {
+			new Notice("No active file");
 			return;
 		}
-			
-		let renamedCount = await this.renameAttachmentsForActiveMD(mdfile);
+
+		// Only handle markdown and canvas files
+		if (!activeFile.path.endsWith(".md") && !activeFile.path.endsWith(".canvas")) {
+			new Notice("Active file must be a markdown or canvas file");
+			return;
+		}
+		
+		let renamedCount = await this.renameAttachmentsForActiveMD(activeFile);
 		
 		if (renamedCount == 0)
 			new Notice("No files found that need to be renamed");
@@ -70,7 +69,6 @@ export default class ConsistentAttachmentsAndLinks extends Plugin {
 		else
 			new Notice("Renamed " + renamedCount + " files.");
 	}
-
 
 	async renameAttachmentIfNeeded(file: TAbstractFile): Promise<boolean> {
 		let filePath = file.path;
@@ -85,20 +83,22 @@ export default class ConsistentAttachmentsAndLinks extends Plugin {
 			return false;
 		}
 
-		let notes = await this.lh.getNotesThatHaveLinkToFile(filePath);
+		// Get both markdown and canvas notes that reference this file
+		let mdNotes = await this.lh.getNotesThatHaveLinkToFile(filePath);
+		let canvasNotes = await this.lh.getNotesThatHaveLinkToFileInCanvas(filePath);
+		let allNotes = [...new Set([...(mdNotes || []), ...(canvasNotes || [])])];
 
-		if (!notes || notes.length == 0) {
+		if (!allNotes || allNotes.length == 0) {
 			if (this.settings.renameOnlyLinkedAttachments) {
 				return false;
 			}
 		}
 
 		let validPath = this.lh.getFilePathWithRenamedBaseName(filePath, validBaseName);
-
-		let targetFileAlreadyExists = await this.app.vault.adapter.exists(validPath)
+		let targetFileAlreadyExists = await this.app.vault.adapter.exists(validPath);
 
 		if (targetFileAlreadyExists) {
-			//if file content is the same in both files, one of them will be deleted			
+			// Handle existing file case...
 			let validAnotherFileBaseName = await this.generateValidBaseName(validPath);
 			if (validAnotherFileBaseName != validBaseName) {
 				console.warn("Unique attachments: cant rename file \n   " + filePath + "\n    to\n   " + validPath + "\n   Another file exists with the same (target) name but different content.")
@@ -106,7 +106,7 @@ export default class ConsistentAttachmentsAndLinks extends Plugin {
 			}
 
 			if (!this.settings.mergeTheSameAttachments) {
-				console.warn("Unique attachments: cant rename file \n   " + filePath + "\n    to\n   " + validPath + "\n   Another file exists with the same (target) name and the same content. You can enable \"Delte duplicates\" setting for delete this file and merge attachments.")
+				console.warn("Unique attachments: cant rename file \n   " + filePath + "\n    to\n   " + validPath + "\n   Another file exists with the same (target) name and the same content. You can enable \"Delete duplicates\" setting for delete this file and merge attachments.")
 				return false;
 			}
 
@@ -117,9 +117,14 @@ export default class ConsistentAttachmentsAndLinks extends Plugin {
 				return false;
 			}
 
-			if (notes) {
-				for (let note of notes) {
-					await this.lh.updateChangedPathInNote(note, filePath, validPath);
+			// Update references in both markdown and canvas files
+			if (allNotes) {
+				for (let note of allNotes) {
+					if (note.endsWith('.canvas')) {
+						await this.lh.updateChangedPathInCanvas(note, filePath, validPath);
+					} else {
+						await this.lh.updateChangedPathInNote(note, filePath, validPath);
+					}
 				}
 			}
 
@@ -128,13 +133,18 @@ export default class ConsistentAttachmentsAndLinks extends Plugin {
 			try {
 				await this.app.vault.rename(file, validPath);
 			} catch (e) {
-				console.error("Unique attachments: cant rename file \n   " + filePath + "\n   to \n   " + validPath + "   \n" + e);
+				console.error("Unique attachments: cant rename file \n   " + filePath + "\n   to\n   " + validPath + "   \n" + e);
 				return false;
 			}
 
-			if (notes) {
-				for (let note of notes) {
-					await this.lh.updateChangedPathInNote(note, filePath, validPath);
+			// Update references in both markdown and canvas files
+			if (allNotes) {
+				for (let note of allNotes) {
+					if (note.endsWith('.canvas')) {
+						await this.lh.updateChangedPathInCanvas(note, filePath, validPath);
+					} else {
+						await this.lh.updateChangedPathInNote(note, filePath, validPath);
+					}
 				}
 			}
 
@@ -144,45 +154,45 @@ export default class ConsistentAttachmentsAndLinks extends Plugin {
 		return true;
 	}
 
-	// just rename the files and let Obsidian to update the links
 	async renameAttachmentsForActiveMD(mdfile: TFile): Promise<number> {
-
-		let rlinks = Object.keys(this.app.metadataCache.resolvedLinks[mdfile.path]);
 		let renamedCount = 0;
+		let currentView = this.app.workspace.activeLeaf.view;
 		
-		let actMetadataCache = this.app.metadataCache.getFileCache(mdfile);
-		let currentView = this.app.workspace.activeLeaf.view as MarkdownView;
+		// Handle markdown files
+		if (mdfile.extension === 'md') {
+			let rlinks = Object.keys(this.app.metadataCache.resolvedLinks[mdfile.path]);
+			let actMetadataCache = this.app.metadataCache.getFileCache(mdfile);
 
-		for (let rlink of rlinks) {
-			let file = this.app.vault.getAbstractFileByPath(rlink)
-			let filePath = file.path;
-			if (this.checkFilePathIsIgnored(filePath) || !this.checkFileTypeIsAllowed(filePath)) {
-				continue;
-			}
+			for (let rlink of rlinks) {
+				let file = this.app.vault.getAbstractFileByPath(rlink);
+				if (!file) continue;
 
-			let ext = path.extname(filePath);
-			let baseName = path.basename(filePath, ext);
-			let validBaseName = await this.generateValidBaseName(filePath);
-			if (baseName == validBaseName) {
-				continue;
+				let renamed = await this.renameAttachmentIfNeeded(file);
+				if (renamed) renamedCount++;
 			}
+		}
+		// Handle canvas files
+		else if (mdfile.extension === 'canvas') {
+			let content = await this.app.vault.read(mdfile);
+			let canvasData = JSON.parse(content);
 
-			if (this.settings.savePreviousName) {
-				this.saveAttachmentNameInLink(actMetadataCache, mdfile, file, baseName, currentView);
-			}
-			currentView.save();
+			for (let node of canvasData.nodes) {
+				if (node.type === 'file' && node.file) {
+					let filePath = this.lh.getFullPathForLink(node.file, mdfile.path);
+					let file = this.app.vault.getAbstractFileByPath(filePath);
+					if (!file) continue;
 
-			if (!this.renameAttachment(file, validBaseName)) {
-				continue;
+					let renamed = await this.renameAttachmentIfNeeded(file);
+					if (renamed) renamedCount++;
+				}
 			}
-			renamedCount++;
 		}
 
 		return renamedCount;
 	}
-	
+
 	saveAttachmentNameInLink(mdc: CachedMetadata, mdfile: TFile, file: TAbstractFile, baseName: string, currentView: MarkdownView) {
-		let cmDoc = currentView.sourceMode.cmEditor;
+		let cmDoc = currentView.editor;
 		if (!mdc.links) {
 			return;
 		}
@@ -206,7 +216,6 @@ export default class ConsistentAttachmentsAndLinks extends Plugin {
 	}
 
 	async renameAttachment(file: TAbstractFile, validBaseName: string): Promise<boolean> {
-
 		let validPath = this.lh.getFilePathWithRenamedBaseName(file.path, validBaseName);
 
 		let targetFileAlreadyExists = await this.app.vault.adapter.exists(validPath)
@@ -241,7 +250,7 @@ export default class ConsistentAttachmentsAndLinks extends Plugin {
 			try {
 				await this.app.fileManager.renameFile(file, validPath);
 			} catch (e) {
-				console.error("Unique attachments: cant rename file \n   " + file.path + "\n   to \n   " + validPath + "   \n" + e);
+				console.error("Unique attachments: cant rename file \n   " + file.path + "\n   to\n   " + validPath + "   \n" + e);
 				return false;
 			}
 
@@ -249,7 +258,6 @@ export default class ConsistentAttachmentsAndLinks extends Plugin {
 		}
 		return true;
 	}
-
 
 	checkFilePathIsIgnored(filePath: string): boolean {
 		for (let folder of this.settings.ignoreFolders) {
@@ -259,7 +267,6 @@ export default class ConsistentAttachmentsAndLinks extends Plugin {
 		return false;
 	}
 
-
 	checkFileTypeIsAllowed(filePath: string): boolean {
 		for (let ext of this.settings.renameFileTypes) {
 			if (filePath.endsWith("." + ext))
@@ -267,7 +274,6 @@ export default class ConsistentAttachmentsAndLinks extends Plugin {
 		}
 		return false;
 	}
-
 
 	async generateValidBaseName(filePath: string) {
 		let file = this.lh.getFileByPath(filePath);
@@ -284,7 +290,6 @@ export default class ConsistentAttachmentsAndLinks extends Plugin {
 		return hash;
 	}
 
-
 	async loadSettings() {
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
 	}
@@ -292,8 +297,6 @@ export default class ConsistentAttachmentsAndLinks extends Plugin {
 	async saveSettings() {
 		await this.saveData(this.settings);
 	}
-
-
 }
 
 
